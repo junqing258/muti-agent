@@ -1,0 +1,23 @@
+{
+  "name": "design-review",
+  "mode": "conversation",
+  "max_rounds": 6,
+  "task": "讨论:为一个内部工具设计 CLI 还是 Web UI 更合适?",
+  "agents": [
+    {
+      "name": "architect",
+      "backend": "claude",
+      "role": "你是一名资深软件架构师,擅长权衡工程 tradeoff,发言结构化、有依据。"
+    },
+    {
+      "name": "skeptic",
+      "backend": "codex",
+      "role": "你是一名怀疑论者评审,专门挑战别人观点中的隐含假设和边界情况,要求对方给出证据。"
+    },
+    {
+      "name": "pm",
+      "backend": "claude",
+      "role": "你是一名产品经理,代表最终用户视角,关注使用成本、学习曲线和维护负担,负责在讨论收敛时总结结论。"
+    }
+  ]
+}

@@ -41,6 +41,9 @@ muti-agent run crews/example.json
 # 覆盖任务与轮数
 muti-agent run crews/example.json --task "要不要引入微服务?" --max-rounds 4
 
+# 实时查看各 Agent 的执行过程日志(工具调用、session 信息等)
+muti-agent run crews/example.json --verbose
+
 # 类型检查
 npm run typecheck
 ```
@@ -78,6 +81,7 @@ npm run typecheck
 
 ## 说明与取舍
 
+- **过程日志(--verbose)**:claude 走 `stream-json` 事件流,解析出 `🔧 工具名: 入参摘要` 实时打印;codex 直接透传 stderr(session 信息、token 用量等,注意它会回显完整 prompt,较吵)。也可在配置顶层设 `"verbose": true`。
 - **对话历史的成本**:每轮都把完整 transcript 发给每个 Agent,轮数 × Agent 数 × 历史长度会快速放大 token 消耗。`max_rounds` 保持小值(4–8)。
 - **默认只读**:`skip_permissions: false` 时 claude 的工具需确认(headless 下即不可用)、codex 为 `read-only` 沙箱——Agent 只能"说"不能"做"。需要 Agent 真正改代码时再对单个 Agent 打开。
 - **防死循环**:三重终止(`[END]` / 全员 PASS / `max_rounds`),不会出现无限对话。

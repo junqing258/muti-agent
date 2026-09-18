@@ -1,0 +1,28 @@
+{
+  "name": "@damenluo/muti-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "类 CrewAI 多 Agent 协作框架,复用 claude / codex CLI 作为 Agent 执行体",
+  "bin": {
+    "muti-agent": "src/crew.ts"
+  },
+  "files": [
+    "src",
+    "crews"
+  ],
+  "engines": {
+    "node": ">=23.6"
+  },
+  "scripts": {
+    "crew": "node src/crew.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.1",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "chalk": "^6.0.0"
+  }
+}

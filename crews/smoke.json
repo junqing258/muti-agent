@@ -1,0 +1,20 @@
+{
+  "name": "smoke",
+  "mode": "conversation",
+  "max_rounds": 2,
+  "task": "快速确认:Python 的 GIL 是什么?第一位发言者只给出一句话定义,不要结束讨论;第二位发言者补充或确认后立即结束讨论。",
+  "agents": [
+    {
+      "name": "bob",
+      "backend": "codex",
+      "role": "你是一名简洁的工程师,回答问题直奔主题。",
+      "timeout": 120
+    },
+    {
+      "name": "alice",
+      "backend": "claude",
+      "role": "你是一名简洁的工程师,回答问题直奔主题。",
+      "timeout": 120
+    }
+  ]
+}
