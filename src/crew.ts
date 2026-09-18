@@ -6,7 +6,8 @@
  *   - 每个 Agent = 一次 CLI headless 调用(claude -p / codex exec)
  *   - 编排器维护共享对话记录,按轮次分发给各 Agent
  *   - 支持两种协作模式:
- *       conversation: 自主多轮对话,Agent 互相应答,PASS 跳过 / [END] 结束
+ *       conversation: 自主多轮对话,由调度 Agent(AI moderator)动态决定
+ *                     下一个发言者与终止时机;Agent 可提出完成候选,但无结束权
  *       sequential:   顺序流水线,前一个 Agent 的产出作为后一个的输入
  *
  * 用法:
@@ -24,7 +25,20 @@ const PROTOCOL = `\
 1. 轮到你时,基于「任务」和「对话记录」发言,要求简洁、直接、有增量,不要重复别人的观点。
 2. 可以点名其他 Agent 提问、补充或反驳。
 3. 如果本轮你没有新内容要补充,只回复一个单词:PASS
-4. 如果你认为任务已完成、讨论已收敛,在正常发言之后,最后一行单独输出:[END]
+4. 如果你认为任务已完成、讨论已收敛,在正常发言之后,最后一行单独输出:[DONE]。
+   [DONE] 只是完成候选,由调度器根据完整记录作最终判定,不会立即结束讨论。
+`;
+
+/** 调度器(moderator)的 system prompt:每轮决策下一个发言者或终止。 */
+const SCHEDULER_ROLE = `\
+你是多 Agent 讨论的调度器(moderator),不参与讨论本身。你是唯一拥有结束讨论权限的角色:根据「任务」「Agent 列表」「对话记录」,决定下一个发言的 Agent,或判定任务已完成。
+调度原则:
+1. 优先选与当前议题最相关、最可能有增量观点的 Agent(被点名提问/反驳的 Agent 优先)。
+2. 不要连续两轮指定同一个 Agent;刚 PASS 的 Agent 除非被点名,否则不要选。
+3. Agent 的 [DONE] 仅表示完成候选,不是结束指令。选择 END 前必须确认任务要求已有可用结果,关键异议或待办已关闭,继续发言不会带来有效增量。
+4. 只要完成条件不明确、缺少产物或仍有待验证事项,就选择最合适的 Agent 继续处理,不要选择 END。
+只输出一行 JSON,不要输出任何其他内容:
+{"next":"<Agent 名字,或 END>","reason":"<不超过一句话的中文理由>"}
 `;
 
 // ---------- 类型 ----------
@@ -41,12 +55,19 @@ interface AgentConfig {
   timeout?: number;           // 单次发言超时(秒)
 }
 
+interface SchedulerConfig {
+  backend?: Backend;
+  model?: string;  // 调度所用模型(建议小而快,不填则用 backend 默认值)
+  timeout?: number;
+}
+
 interface CrewConfig {
   name?: string;
   mode?: string; // conversation | sequential
   max_rounds?: number;
   task?: string;
   verbose?: boolean; // 实时输出各 Agent 的执行过程日志
+  scheduler?: SchedulerConfig;
   agents: AgentConfig[];
 }
 
@@ -59,6 +80,7 @@ interface Message {
 interface Crew {
   name: string;
   agents: Agent[];
+  scheduler: Agent; // conversation 模式的 AI 调度器
   task: string;
   mode: string;
   maxRounds: number;
@@ -234,8 +256,14 @@ class Agent {
 
 function loadCrew(configPath: string, task?: string, maxRounds?: number, verbose?: boolean): Crew {
   const cfg = JSON.parse(readFileSync(configPath, "utf-8")) as CrewConfig;
+  if (!Array.isArray(cfg.agents) || cfg.agents.length === 0) {
+    throw new Error("错误: Crew 至少需要一个 Agent");
+  }
   const agents = cfg.agents.map((a) => new Agent(a));
   const mode = cfg.mode ?? "conversation";
+  if (mode !== "conversation" && mode !== "sequential") {
+    throw new Error(`错误: 未知 mode '${mode}'，仅支持 conversation 或 sequential`);
+  }
   if (mode === "conversation") {
     const names = agents.map((a) => a.name).join("、");
     for (const a of agents) {
@@ -250,10 +278,17 @@ function loadCrew(configPath: string, task?: string, maxRounds?: number, verbose
   return {
     name: cfg.name ?? configPath.replace(/.*\//, "").replace(/\.json$/, ""),
     agents,
+    scheduler: new Agent({
+      name: "scheduler",
+      backend: cfg.scheduler?.backend ?? agents[0].backend,
+      role: SCHEDULER_ROLE,
+      model: cfg.scheduler?.model, // 不指定则用 CLI 默认模型
+      timeout: cfg.scheduler?.timeout ?? 120,
+    }),
     task: finalTask,
     mode,
     maxRounds: maxRounds ?? cfg.max_rounds ?? 6,
-    verbose: verbose ?? cfg.verbose ?? false,
+    verbose: verbose ?? cfg.verbose ?? true,
   };
 }
 
@@ -264,38 +299,83 @@ function renderTranscript(messages: Message[]): string {
     .join("\n\n");
 }
 
-/** 自主多轮对话:round-robin 发言,全员 PASS 或任一 [END] 结束。 */
+/** 调度器输入:任务 + Agent 列表 + 对话记录。 */
+function schedulerPrompt(crew: Crew, messages: Message[]): string {
+  return (
+    `任务:${crew.task}\n\n` +
+    `Agent 列表:\n${crew.agents.map((a) => `- ${a.name}: ${a.role.split("\n\n")[0]}`).join("\n")}\n\n` +
+    `对话记录:\n${renderTranscript(messages)}\n\n` +
+    `---\n请输出 JSON,决定下一个发言者或 END。`
+  );
+}
+
+/** 解析调度器输出;非法时返回 null(调用方回退 round-robin)。 */
+function parseSchedule(reply: string): { next: string; reason: string } | null {
+  const m = reply.match(/\{[^{}]*\}/);
+  if (!m) return null;
+  try {
+    const o = JSON.parse(m[0]) as { next?: unknown; reason?: unknown };
+    if (typeof o.next === "string" && o.next.trim()) {
+      return { next: o.next.trim(), reason: typeof o.reason === "string" ? o.reason : "" };
+    }
+  } catch {
+    // 忽略,走回退
+  }
+  return null;
+}
+
+/** 自主多轮对话:每轮由调度 Agent 决定下一个发言者或最终结束;
+ *  调度失败回退 round-robin。连续全员 PASS 与次数上限仅为防死循环的系统兜底。 */
 async function runConversation(crew: Crew): Promise<Message[]> {
   const messages: Message[] = [];
-  for (let r = 1; r <= crew.maxRounds; r++) {
-    let passes = 0;
-    for (const agent of crew.agents) {
-      const prompt =
-        `任务:${crew.task}\n\n` +
-        `对话记录:\n${renderTranscript(messages)}\n\n` +
-        `---\n轮到你了,${agent.name}。请发言(或回复 PASS / 以 [END] 结束)。`;
-      console.log(`\n${cyan(`[第${r}轮] ${agent.name} (${agent.backend}) 发言中...`)}`);
-      const reply = await agent.say(prompt, crew.verbose);
-      const isEnd = reply.includes("[END]");
-      const isPass = reply.trim().replace(/[.。]$/, "") === "PASS";
-      if (isPass) {
-        passes++;
-        console.log(gray(`${agent.name}: PASS`));
-      } else {
-        messages.push({ round: r, sender: agent.name, content: reply });
-        console.log(reply + "\n");
-      }
-      if (isEnd) {
-        console.log(green("讨论结束([END])"));
-        return messages;
-      }
+  const maxTurns = crew.maxRounds * crew.agents.length; // 语义:每"轮"≈ 每个 Agent 平均发言一次
+  let fallbackIdx = 0; // 回退指针:按配置顺序轮转
+  let consecutivePasses = 0;
+
+  for (let turn = 1; turn <= maxTurns; turn++) {
+    // --- 调度:决定下一个发言者 ---
+    let speaker = crew.agents[fallbackIdx % crew.agents.length];
+    console.log(gray(`调度中(scheduler/${crew.scheduler.model ?? "claude"})...`));
+    const reply = await crew.scheduler.say(schedulerPrompt(crew, messages));
+    const decision = parseSchedule(reply);
+    if (decision?.next === "END") {
+      console.log(green(`讨论结束(调度判定:${decision.reason})`));
+      return messages;
     }
-    if (passes === crew.agents.length) {
-      console.log(green("讨论结束(全员 PASS)"));
+    const picked = decision ? crew.agents.find((a) => a.name === decision.next) : undefined;
+    if (picked && decision) {
+      speaker = picked;
+      fallbackIdx = crew.agents.indexOf(picked) + 1;
+      console.log(gray(`调度 → ${speaker.name}(${decision.reason})`));
+    } else {
+      if (decision) console.log(yellow(`调度指定了未知 Agent「${decision.next}」,回退顺序轮转`));
+      else console.log(yellow("调度输出无法解析,回退顺序轮转"));
+      fallbackIdx++;
+    }
+
+    // --- 发言 ---
+    const prompt =
+      `任务:${crew.task}\n\n` +
+      `对话记录:\n${renderTranscript(messages)}\n\n` +
+      `---\n轮到你了,${speaker.name}。请发言(或回复 PASS / 以 [DONE] 提出完成候选)。`;
+    console.log(`\n${cyan(`[第${turn}次] ${speaker.name} (${speaker.backend}) 发言中...`)}`);
+    const say = await speaker.say(prompt, crew.verbose);
+    const isPass = say.trim().replace(/[.。]$/, "") === "PASS";
+    if (isPass) {
+      consecutivePasses++;
+      messages.push({ round: turn, sender: speaker.name, content: "PASS" });
+      console.log(gray(`${speaker.name}: PASS`));
+    } else {
+      consecutivePasses = 0;
+      messages.push({ round: turn, sender: speaker.name, content: say });
+      console.log(say + "\n");
+    }
+    if (consecutivePasses >= crew.agents.length) {
+      console.log(green("讨论结束(全员连续 PASS；系统兜底)"));
       return messages;
     }
   }
-  console.log(yellow(`达到最大轮数 ${crew.maxRounds},强制结束`));
+  console.log(yellow(`达到最大发言次数 ${maxTurns}(max_rounds=${crew.maxRounds} × ${crew.agents.length}),强制结束`));
   return messages;
 }
 
@@ -333,7 +413,7 @@ const USAGE = `muti-agent —— 类 CrewAI 多 Agent 协作框架(复用 claude
   --task <文本>      覆盖配置中的任务
   --max-rounds <N>   覆盖最大轮数
   -o, --out <目录>   transcript 输出目录(默认 runs/<时间戳>-<crew名>/)
-  --verbose          实时输出各 Agent 的执行过程日志(工具调用等)
+  --verbose          实时输出各 Agent 的执行过程日志(默认开启;配置 "verbose": false 可关闭)
   -h, --help         显示帮助
   -v, --version      显示版本
 `;

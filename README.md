@@ -12,7 +12,9 @@
 │  Agent A ──► claude -p --system-prompt "<角色>"   (子进程)    │
 │  Agent B ──► codex exec --sandbox read-only       (子进程)    │
 │    │                                                         │
-│    ▼ 终止条件:全员 PASS / 任一 Agent 输出 [END] / max_rounds   │
+│  调度 Agent(默认复用首个 Agent 的 backend)── 决定下一个发言者 / END │
+│    │                                                         │
+│    ▼ 终止条件:调度判定 END / 全员 PASS / 次数上限            │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -41,9 +43,6 @@ muti-agent run crews/example.json
 # 覆盖任务与轮数
 muti-agent run crews/example.json --task "要不要引入微服务?" --max-rounds 4
 
-# 实时查看各 Agent 的执行过程日志(工具调用、session 信息等)
-muti-agent run crews/example.json --verbose
-
 # 类型检查
 npm run typecheck
 ```
@@ -58,6 +57,11 @@ npm run typecheck
   "mode": "conversation",     // conversation(自主多轮对话)| sequential(顺序流水线)
   "max_rounds": 6,
   "task": "讨论的问题",         // 可被 --task 覆盖
+  "scheduler": {               // 可选,conversation 模式的 AI 调度器
+    "backend": "claude",      // 可选;不填则复用第一个 Agent 的 backend
+    "model": null,             // 调度决策所用模型;不填用 backend 默认模型
+    "timeout": 120             // 单次调度超时(秒)
+  },
   "agents": [
     {
       "name": "architect",
@@ -76,13 +80,14 @@ npm run typecheck
 
 | 模式 | 行为 | 适用 |
 |---|---|---|
-| `conversation` | round-robin 发言,可见全部历史;`PASS` 跳过,`[END]` 结束,全员 PASS 或达最大轮数终止 | 方案讨论、评审、辩论 |
+| `conversation` | 每次发言前由调度 Agent 全局决策:点名下一个最相关发言者，且仅调度器可在核验任务完成后输出 END。Agent 的 `[DONE]` 仅为完成候选；调度失败自动回退顺序轮转。 | 方案讨论、评审、辩论 |
 | `sequential` | 按配置顺序各执行一次,可见此前所有环节的产出 | 调研→编码→审查流水线 |
 
 ## 说明与取舍
 
-- **过程日志(--verbose)**:claude 走 `stream-json` 事件流,解析出 `🔧 工具名: 入参摘要` 实时打印;codex 直接透传 stderr(session 信息、token 用量等,注意它会回显完整 prompt,较吵)。也可在配置顶层设 `"verbose": true`。
+- **过程日志(--verbose,默认开启)**:claude 走 `stream-json` 事件流,解析出 `🔧 工具名: 入参摘要` 实时打印;codex 直接透传 stderr(session 信息、token 用量等,注意它会回显完整 prompt,较吵)。可在配置顶层设 `"verbose": false` 关闭。
 - **对话历史的成本**:每轮都把完整 transcript 发给每个 Agent,轮数 × Agent 数 × 历史长度会快速放大 token 消耗。`max_rounds` 保持小值(4–8)。
 - **默认只读**:`skip_permissions: false` 时 claude 的工具需确认(headless 下即不可用)、codex 为 `read-only` 沙箱——Agent 只能"说"不能"做"。需要 Agent 真正改代码时再对单个 Agent 打开。
-- **防死循环**:三重终止(`[END]` / 全员 PASS / `max_rounds`),不会出现无限对话。
+- **结束权与防死循环**:任务是否完成只由调度器判定；Agent 的 `[DONE]` 只提示调度器核验。全员连续 PASS 与 `max_rounds × Agent 数` 是调度异常或无进展时的系统兜底，不代表业务验收。调度输出非法(非 JSON / 点了不存在的名字)时回退顺序轮转,不会卡死。
+- **AI 调度的成本**:conversation 模式每次发言前多一次调度调用(小模型,秒级);要极致省 token 可改用 `sequential`,或把 `scheduler.model` 换成更便宜的模型。
 - **扩展 backend**:在 `Agent.buildCmd()` / `say()` 中加一个分支即可接入其他 CLI(如 gemini)。
