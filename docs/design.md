@@ -67,6 +67,7 @@ CrewAI 等多 Agent 框架的核心价值不在 Agent 本身,而在**编排**:�
 | **Backend** | CLI 适配层:负责把"角色 + prompt"翻译成具体 CLI 调用并回收输出 | LLM provider |
 | **Crew** | 一组 Agent + 一个任务 + 协作模式 + 终止参数,由 JSON 配置声明 | Crew |
 | **Transcript** | 共享对话记录,编排器持有,每轮全量注入 | 共享上下文 |
+| **Agent Session** | 可选的、每个 Agent 独立的 CLI 原生会话；保留模型和工具上下文 | 私有短期记忆 |
 | **Turn / Round** | 一个 Agent 发言一次为一 Turn;所有 Agent 各发言一次为一 Round | — |
 
 ### 3.2 模块划分
@@ -85,6 +86,8 @@ CrewAI 等多 Agent 框架的核心价值不在 Agent 本身,而在**编排**:�
 ### 4.1 conversation:自主多轮对话(主模式)
 
 **调度**:每次发言前由 Scheduler 根据任务、角色列表和完整 transcript 选择最合适的下一位 Agent，或在核验完成条件后结束。调度输出失效时才按配置顺序 round-robin 回退。
+
+**可选原生会话记忆**:顶层 `session_memory: true` 时，编排器为每个 Agent（含 Scheduler）维护独立 session ID。后续调用恢复各自会话，只注入其自上次发言后新增的 transcript，既保留工具与模型上下文，也避免将整段历史重复发送。该能力默认关闭，避免 CLI 在本地保留会话数据；可按 Agent 或 Scheduler 单独覆盖。
 
 **协作协议**(注入每个 Agent 的 system prompt):
 
@@ -120,6 +123,7 @@ CrewAI 等多 Agent 框架的核心价值不在 Agent 本身,而在**编排**:�
   "mode": "conversation",       // conversation | sequential
   "max_rounds": 6,              // conversation 模式兜底轮数
   "task": "讨论的问题",          // 可被 CLI --task 覆盖
+  "session_memory": false,      // 可选;全局默认值，可由 Agent / scheduler 覆盖
   "agents": [
     {
       "name": "architect",      // 对话中互相点名的标识
@@ -128,7 +132,8 @@ CrewAI 等多 Agent 框架的核心价值不在 Agent 本身,而在**编排**:�
       "model": null,            // 可选:覆盖 CLI 默认模型
       "skip_permissions": false,// true = 允许免确认使用工具(写文件/执行命令)
       "extra_args": [],         // 追加给 CLI 的原始参数(逃生舱)
-      "timeout": 300            // 单次发言超时(秒)
+      "timeout": 300,           // 单次发言超时(秒)
+      "session_memory": true    // 可选;覆盖全局 session_memory
     }
   ]
 }

@@ -15,6 +15,7 @@
  */
 import chalk from "chalk";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
@@ -53,12 +54,14 @@ interface AgentConfig {
   skip_permissions?: boolean; // 允许 CLI 免确认使用工具(写文件/执行命令)
   extra_args?: string[];      // 追加给 CLI 的原始参数
   timeout?: number;           // 单次发言超时(秒)
+  session_memory?: boolean;   // 为该 Agent 保留 CLI 原生会话(可覆盖 Crew 默认值)
 }
 
 interface SchedulerConfig {
   backend?: Backend;
   model?: string;  // 调度所用模型(建议小而快,不填则用 backend 默认值)
   timeout?: number;
+  session_memory?: boolean;
 }
 
 interface CrewConfig {
@@ -67,6 +70,7 @@ interface CrewConfig {
   max_rounds?: number;
   task?: string;
   verbose?: boolean; // 实时输出各 Agent 的执行过程日志
+  session_memory?: boolean; // 默认值;Agent / scheduler 可单独覆盖
   scheduler?: SchedulerConfig;
   agents: AgentConfig[];
 }
@@ -176,6 +180,9 @@ class Agent {
   skipPermissions: boolean;
   extraArgs: string[];
   timeout: number;
+  sessionMemory: boolean;
+  sessionId?: string;
+  seenMessageCount = 0;
 
   constructor(cfg: AgentConfig) {
     this.name = cfg.name;
@@ -185,9 +192,10 @@ class Agent {
     this.skipPermissions = cfg.skip_permissions ?? false;
     this.extraArgs = cfg.extra_args ?? [];
     this.timeout = cfg.timeout ?? 300;
+    this.sessionMemory = cfg.session_memory ?? false;
   }
 
-  private buildCmd(verbose: boolean): string[] {
+  private buildCmd(verbose: boolean, newSessionId?: string): string[] {
     let cmd: string[];
     if (this.backend === "claude") {
       cmd = verbose
@@ -196,12 +204,26 @@ class Agent {
         : ["claude", "-p", "--output-format", "text", "--system-prompt", this.role];
       if (this.model) cmd.push("--model", this.model);
       if (this.skipPermissions) cmd.push("--dangerously-skip-permissions");
+      if (this.sessionMemory) {
+        if (this.sessionId) cmd.push("--resume", this.sessionId);
+        else if (newSessionId) cmd.push("--session-id", newSessionId);
+      }
     } else if (this.backend === "codex") {
-      cmd = [
-        "codex", "exec", "--skip-git-repo-check",
-        "--sandbox", this.skipPermissions ? "workspace-write" : "read-only",
-      ];
-      if (this.model) cmd.push("--model", this.model);
+      cmd = ["codex", "exec"];
+      if (this.sessionMemory && this.sessionId) {
+        // `codex exec resume` 不接受 --sandbox；恢复时沿用首次建立该 session 的权限策略。
+        cmd.push("resume", "--skip-git-repo-check");
+        if (this.model) cmd.push("--model", this.model);
+        cmd.push(this.sessionId);
+      } else {
+        cmd.push(
+          "--skip-git-repo-check",
+          "--sandbox", this.skipPermissions ? "workspace-write" : "read-only",
+        );
+        if (this.model) cmd.push("--model", this.model);
+        // 首次启动时以 JSONL 取得该 Agent 专属 thread_id；续接时已知 ID，无需改变正常文本输出。
+        if (this.sessionMemory) cmd.push("--json");
+      }
     } else {
       throw new Error(`Agent ${this.name}: 未知 backend '${this.backend}'`);
     }
@@ -210,20 +232,33 @@ class Agent {
 
   /** 发起一次 headless 调用,返回文本输出。verbose 时实时输出执行过程日志。 */
   async say(prompt: string, verbose = false): Promise<string> {
-    const cmd = this.buildCmd(verbose);
+    const newSessionId = this.backend === "claude" && this.sessionMemory && !this.sessionId
+      ? randomUUID()
+      : undefined;
+    const cmd = this.buildCmd(verbose, newSessionId);
     let input: string | null = prompt; // claude -p 从 stdin 读 prompt
     if (this.backend === "codex") {
       // codex 无独立 system-prompt 参数,角色并入 prompt,经参数传入
       cmd.push(`${this.role}\n\n---\n\n${prompt}`);
       input = null;
       // codex 的执行过程日志在 stderr,verbose 时实时透传
-      return runCli(cmd, input, this.timeout, verbose
+      const output = await runCli(cmd, input, this.timeout, verbose
         ? (line, stream) => {
             if (stream === "stderr") console.log(gray(`  │ ${line}`));
           }
         : undefined);
+      if (this.sessionMemory && !this.sessionId) {
+        const parsed = parseCodexSession(output);
+        if (parsed.sessionId) this.sessionId = parsed.sessionId;
+        return parsed.content ?? output;
+      }
+      return output;
     }
-    if (!verbose) return runCli(cmd, input, this.timeout);
+    if (!verbose) {
+      const output = await runCli(cmd, input, this.timeout);
+      if (newSessionId && !isCliFailure(output)) this.sessionId = newSessionId;
+      return output;
+    }
     // claude:stream-json 事件流,提取工具调用过程,最终结果取自 result 事件
     let result: string | null = null;
     const out = await runCli(cmd, input, this.timeout, (line, stream) => {
@@ -248,8 +283,38 @@ class Agent {
         result = ev.result;
       }
     });
-    return result ?? out;
+    const output = result ?? out;
+    if (newSessionId && !isCliFailure(output)) this.sessionId = newSessionId;
+    return output;
   }
+}
+
+function isCliFailure(output: string): boolean {
+  return output.startsWith("(调用超时)") || output.startsWith("(找不到命令:") || output.startsWith("(调用失败 exit=");
+}
+
+/** 从首次 `codex exec --json` 的 JSONL 中提取专属 thread_id 和最终 Agent 文本。 */
+function parseCodexSession(output: string): { sessionId?: string; content?: string } {
+  let sessionId: string | undefined;
+  let content: string | undefined;
+  for (const line of output.split("\n")) {
+    try {
+      const event = JSON.parse(line) as {
+        type?: unknown;
+        thread_id?: unknown;
+        item?: { type?: unknown; text?: unknown };
+      };
+      if (event.type === "thread.started" && typeof event.thread_id === "string") {
+        sessionId = event.thread_id;
+      }
+      if (event.type === "item.completed" && event.item?.type === "agent_message" && typeof event.item.text === "string") {
+        content = event.item.text;
+      }
+    } catch {
+      // 非 JSONL 行属于 CLI 警告或错误,不影响正常结果提取。
+    }
+  }
+  return { sessionId, content };
 }
 
 // ---------- Crew:配置与编排 ----------
@@ -259,7 +324,10 @@ function loadCrew(configPath: string, task?: string, maxRounds?: number, verbose
   if (!Array.isArray(cfg.agents) || cfg.agents.length === 0) {
     throw new Error("错误: Crew 至少需要一个 Agent");
   }
-  const agents = cfg.agents.map((a) => new Agent(a));
+  const agents = cfg.agents.map((a) => new Agent({
+    ...a,
+    session_memory: a.session_memory ?? cfg.session_memory ?? false,
+  }));
   const mode = cfg.mode ?? "conversation";
   if (mode !== "conversation" && mode !== "sequential") {
     throw new Error(`错误: 未知 mode '${mode}'，仅支持 conversation 或 sequential`);
@@ -284,6 +352,7 @@ function loadCrew(configPath: string, task?: string, maxRounds?: number, verbose
       role: SCHEDULER_ROLE,
       model: cfg.scheduler?.model, // 不指定则用 CLI 默认模型
       timeout: cfg.scheduler?.timeout ?? 120,
+      session_memory: cfg.scheduler?.session_memory ?? cfg.session_memory ?? false,
     }),
     task: finalTask,
     mode,
@@ -307,6 +376,24 @@ function schedulerPrompt(crew: Crew, messages: Message[]): string {
     `对话记录:\n${renderTranscript(messages)}\n\n` +
     `---\n请输出 JSON,决定下一个发言者或 END。`
   );
+}
+
+/** 有原生会话的 Agent 只接收自上次发言以来的增量；无会话时维持全量 transcript 注入。 */
+function contextFor(agent: Agent, messages: Message[]): Message[] {
+  return agent.sessionMemory && agent.sessionId
+    ? messages.slice(agent.seenMessageCount)
+    : messages;
+}
+
+function contextLabel(agent: Agent): string {
+  return agent.sessionMemory && agent.sessionId
+    ? "自上次你发言后的对话记录"
+    : "对话记录";
+}
+
+/** 成功建立原生会话后，记录该 Agent 已经从其 CLI 会话中看到的 transcript 位置。 */
+function markContextSeen(agent: Agent, messages: Message[]): void {
+  if (agent.sessionMemory && agent.sessionId) agent.seenMessageCount = messages.length;
 }
 
 /** 解析调度器输出;非法时返回 null(调用方回退 round-robin)。 */
@@ -336,7 +423,8 @@ async function runConversation(crew: Crew): Promise<Message[]> {
     // --- 调度:决定下一个发言者 ---
     let speaker = crew.agents[fallbackIdx % crew.agents.length];
     console.log(gray(`调度中(scheduler/${crew.scheduler.model ?? "claude"})...`));
-    const reply = await crew.scheduler.say(schedulerPrompt(crew, messages));
+    const reply = await crew.scheduler.say(schedulerPrompt(crew, contextFor(crew.scheduler, messages)));
+    markContextSeen(crew.scheduler, messages);
     const decision = parseSchedule(reply);
     if (decision?.next === "END") {
       console.log(green(`讨论结束(调度判定:${decision.reason})`));
@@ -356,7 +444,7 @@ async function runConversation(crew: Crew): Promise<Message[]> {
     // --- 发言 ---
     const prompt =
       `任务:${crew.task}\n\n` +
-      `对话记录:\n${renderTranscript(messages)}\n\n` +
+      `${contextLabel(speaker)}:\n${renderTranscript(contextFor(speaker, messages))}\n\n` +
       `---\n轮到你了,${speaker.name}。请发言(或回复 PASS / 以 [DONE] 提出完成候选)。`;
     console.log(`\n${cyan(`[第${turn}次] ${speaker.name} (${speaker.backend}) 发言中...`)}`);
     const say = await speaker.say(prompt, crew.verbose);
@@ -370,6 +458,7 @@ async function runConversation(crew: Crew): Promise<Message[]> {
       messages.push({ round: turn, sender: speaker.name, content: say });
       console.log(say + "\n");
     }
+    markContextSeen(speaker, messages);
     if (consecutivePasses >= crew.agents.length) {
       console.log(green("讨论结束(全员连续 PASS；系统兜底)"));
       return messages;

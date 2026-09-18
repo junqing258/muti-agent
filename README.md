@@ -57,10 +57,12 @@ npm run typecheck
   "mode": "conversation",     // conversation(自主多轮对话)| sequential(顺序流水线)
   "max_rounds": 6,
   "task": "讨论的问题",         // 可被 --task 覆盖
+  "session_memory": false,     // 可选;为每个 Agent 保留其 CLI 原生会话
   "scheduler": {               // 可选,conversation 模式的 AI 调度器
     "backend": "claude",      // 可选;不填则复用第一个 Agent 的 backend
     "model": null,             // 调度决策所用模型;不填用 backend 默认模型
-    "timeout": 120             // 单次调度超时(秒)
+    "timeout": 120,            // 单次调度超时(秒)
+    "session_memory": true     // 可选;覆盖 Crew 的 session_memory
   },
   "agents": [
     {
@@ -70,7 +72,8 @@ npm run typecheck
       "model": null,          // 可选,覆盖 CLI 默认模型
       "skip_permissions": false, // true = Agent 可免确认写文件/跑命令(慎用)
       "extra_args": [],       // 追加给 CLI 的原始参数
-      "timeout": 300          // 单次发言超时(秒)
+      "timeout": 300,         // 单次发言超时(秒)
+      "session_memory": true  // 可选;覆盖 Crew 的 session_memory
     }
   ]
 }
@@ -87,6 +90,7 @@ npm run typecheck
 
 - **过程日志(--verbose,默认开启)**:claude 走 `stream-json` 事件流,解析出 `🔧 工具名: 入参摘要` 实时打印;codex 直接透传 stderr(session 信息、token 用量等,注意它会回显完整 prompt,较吵)。可在配置顶层设 `"verbose": false` 关闭。
 - **对话历史的成本**:每轮都把完整 transcript 发给每个 Agent,轮数 × Agent 数 × 历史长度会快速放大 token 消耗。`max_rounds` 保持小值(4–8)。
+- **原生会话记忆(可选)**:设定顶层 `"session_memory": true` 后，每个 Agent 与 Scheduler 都会维持各自独立的 CLI session；后续 prompt 只注入该角色尚未看到的 transcript 增量，保留工具上下文并减少重复 token。可在 Agent 或 `scheduler` 上单独覆盖。该模式会由 CLI 在本机保存会话记录，敏感任务请保持默认 `false`；Codex 恢复时沿用首次创建会话的权限策略。session ID 仅存在于当前 `muti-agent run` 进程，下一次运行会创建新会话。
 - **默认只读**:`skip_permissions: false` 时 claude 的工具需确认(headless 下即不可用)、codex 为 `read-only` 沙箱——Agent 只能"说"不能"做"。需要 Agent 真正改代码时再对单个 Agent 打开。
 - **结束权与防死循环**:任务是否完成只由调度器判定；Agent 的 `[DONE]` 只提示调度器核验。全员连续 PASS 与 `max_rounds × Agent 数` 是调度异常或无进展时的系统兜底，不代表业务验收。调度输出非法(非 JSON / 点了不存在的名字)时回退顺序轮转,不会卡死。
 - **AI 调度的成本**:conversation 模式每次发言前多一次调度调用(小模型,秒级);要极致省 token 可改用 `sequential`,或把 `scheduler.model` 换成更便宜的模型。
